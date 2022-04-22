@@ -17,7 +17,7 @@ pub const Isp = struct {
             .parity = .none,
             .stop_bits = .one,
             .word_size = 8,
-            .handshake = .none,
+            .handshake = .software,
         });
 
         return Self{
@@ -96,18 +96,21 @@ pub const Isp = struct {
             }
         }
         // device is echoing while handshaking, so we have to expected "request\r\nanswer\r\n"
-        try self.expectLine("Synchronized\x0DOK");
+        try self.expectLine("Synchronized");
+        try self.expectLine("OK");
 
-        var buffer: [64]u8 = undefined;
-        const fmt = try std.fmt.bufPrint(&buffer, "{d}\r\n", .{options.freq});
-        try writer.writeAll(fmt);
+        var buf: [64]u8 = undefined;
+        const freq_str = std.fmt.bufPrint(&buf, "{d}", .{options.freq}) catch unreachable;
 
-        const response = try std.fmt.bufPrint(&buffer, "{d}\rOK", .{options.freq});
-        try self.expectLine(response);
+        try writer.print("{s}\r", .{freq_str});
 
-        // Turn echo off
-        try writer.writeAll("A 0\r\n");
-        try self.expectLine("A 0\r0");
+        try self.expectLine(freq_str);
+        try self.expectLine("OK");
+
+        // // Turn echo off
+        // try writer.writeAll("A 1\r\n");
+        // try self.expectLine("A 1");
+        // try self.expectLine("0");
     }
 
     pub fn unlock(self: Self) !void {
@@ -116,9 +119,6 @@ pub const Isp = struct {
     pub fn setBaudRate(self: Self) !void {
         _ = self;
     }
-    // pub fn echo(self: Self) !void {
-    //     _ = self;
-    // }
 
     /// Writes data into the chip ram.
     /// - `offset` is the base address the data will go. Must be aligned to 4.
@@ -126,6 +126,9 @@ pub const Isp = struct {
     pub fn writeToRam(self: Self, offset: u32, buffer: []const u8) !void {
         std.debug.assert(std.mem.isAligned(offset, 4));
         std.debug.assert(std.mem.isAligned(buffer.len, 4));
+
+        const failure_limit = 3; // resend blocks up to N times
+        var failure_counter: usize = 0;
 
         var len_buf: [16]u8 = undefined;
         var off_buf: [16]u8 = undefined;
@@ -135,8 +138,6 @@ pub const Isp = struct {
 
         try self.exec(.write_to_ram, &.{ off_digits, len_digits });
 
-        const writer = self.port.writer();
-
         var i: usize = 0;
         var lines: u32 = 0;
         var calc_checksum: u32 = 0;
@@ -144,9 +145,11 @@ pub const Isp = struct {
         while (i < buffer.len) {
             const transmit_len = std.math.min(45, buffer.len - i);
             const segment = buffer[i .. i + transmit_len];
-
-            try uuencode.encodeLine(writer, segment);
-            try writer.writeAll("\r\n");
+            {
+                var lp = self.linePrinter();
+                try uuencode.encodeLine(lp.writer(), segment);
+                try lp.flush();
+            }
             i += segment.len;
 
             lines += 1;
@@ -159,18 +162,36 @@ pub const Isp = struct {
                     lines = 0;
                     calc_checksum = 0;
                 }
+                {
+                    var lp = self.linePrinter();
+                    try lp.writer().print("{d}", .{calc_checksum});
+                    try lp.flush();
+                }
+                std.log.info("sending checksum: {d}", .{calc_checksum});
 
-                try writer.print("{d}\r\n", .{calc_checksum});
+                checksum_loop: while (true) {
+                    var cs_buffer: [4096]u8 = undefined;
+                    const checksum_request = try self.fetchLine(&cs_buffer);
 
-                var cs_buffer: [64]u8 = undefined;
-                const checksum_request = try self.fetchLine(&cs_buffer);
+                    if (std.mem.eql(u8, checksum_request, "OK")) {
+                        checksum_offset = i;
+                        failure_counter = 0;
+                        break :checksum_loop;
+                    } else if (std.mem.eql(u8, checksum_request, "RESEND")) {
+                        std.log.info("bad checksum, resend data...", .{});
+                        i = checksum_offset;
 
-                if (std.mem.eql(u8, checksum_request, "OK")) {
-                    checksum_offset = i;
-                } else if (std.mem.eql(u8, checksum_request, "RESEND")) {
-                    i = checksum_offset;
-                } else {
-                    return error.UnexpectedData;
+                        failure_counter += 1;
+                        if (failure_counter >= failure_limit) {
+                            return error.TooManyErrors;
+                        }
+
+                        break :checksum_loop;
+                    } else {
+                        std.log.err("unexpected checksum response: {s}", .{std.fmt.fmtSliceEscapeUpper(checksum_request)});
+
+                        return error.UnexpectedData;
+                    }
                 }
             }
         }
@@ -196,15 +217,12 @@ pub const Isp = struct {
         var calc_checksum: u32 = 0;
         var checksum_offset: usize = 0;
         while (i < buffer.len) {
+            var line_string_buffer: [128]u8 = undefined;
+
+            const line_string = try self.fetchLine(&line_string_buffer);
+
             var line_buffer: [45]u8 = undefined;
-            const line = try uuencode.decodeLine(self.port.reader(), &line_buffer);
-
-            var rest_buffer: [64]u8 = undefined;
-            const rest = try self.fetchLine(&rest_buffer);
-
-            if (rest.len > 0) {
-                std.log.warn("received garbage data after uuencoded: {s}", .{rest});
-            }
+            const line = try uuencode.decodeLine(std.io.fixedBufferStream(line_string).reader(), &line_buffer);
 
             std.mem.copy(u8, buffer[i..], line);
             i += line.len;
@@ -225,16 +243,20 @@ pub const Isp = struct {
 
                 const sent_checksum = try std.fmt.parseInt(u32, checksum_str, 10);
 
-                if (sent_checksum != calc_checksum) {
+                if (sent_checksum == calc_checksum) {
+                    checksum_offset = i;
+                    var lp = self.linePrinter();
+                    try lp.writer().writeAll("OK");
+                    try lp.flush();
+                } else {
                     std.log.err("checksum mismatch: Expected {d}, received {d}", .{
                         calc_checksum,
                         sent_checksum,
                     });
-                    try self.port.writeAll("RESEND\r\n");
+                    var lp = self.linePrinter();
+                    try lp.writer().writeAll("RESEND");
+                    try lp.flush();
                     i = checksum_offset;
-                } else {
-                    checksum_offset = i;
-                    try self.port.writeAll("OK\r\n");
                 }
             }
         }
@@ -249,8 +271,13 @@ pub const Isp = struct {
     }
 
     pub fn go(self: Self, address: u32) !void {
-        _ = self;
-        _ = address;
+        std.debug.assert(std.mem.isAligned(address, 4));
+
+        var off_buf: [16]u8 = undefined;
+
+        const off_digits = std.fmt.bufPrint(&off_buf, "{d}", .{address}) catch unreachable;
+
+        try self.exec(.go, &.{ off_digits, "T" }); // T is Thumb
     }
 
     pub fn eraseSector(self: Self) !void {
@@ -315,12 +342,15 @@ pub const Isp = struct {
     }
 
     fn exec(self: Self, cmd: Command, args: []const []const u8) !void {
-        var writer = self.port.writer();
-        try writer.print("{c}", .{@enumToInt(cmd)});
-        for (args) |arg| {
-            try writer.print(" {s}", .{arg});
+        var printer = self.linePrinter();
+        {
+            var writer = printer.writer();
+            try writer.print("{c}", .{@enumToInt(cmd)});
+            for (args) |arg| {
+                try writer.print(" {s}", .{arg});
+            }
         }
-        try writer.writeAll("\r\n");
+        try printer.flush();
 
         try self.expectCmdOk();
     }
@@ -330,7 +360,10 @@ pub const Isp = struct {
 
         const ack_string = try self.fetchLine(&buffer);
 
-        const numeric = std.fmt.parseInt(u32, ack_string, 10) catch return error.UnexpectedData;
+        const numeric = std.fmt.parseInt(u32, ack_string, 10) catch {
+            std.log.err("expected response number, got {}", .{std.fmt.fmtSliceEscapeUpper(ack_string)});
+            return error.UnexpectedData;
+        };
 
         const code = std.meta.intToEnum(ErrorCode, numeric) catch return error.UnexpectedData;
 
@@ -350,18 +383,72 @@ pub const Isp = struct {
         }
     }
 
+    fn isLineEnd(c: u8) bool {
+        return (c == '\r' or c == '\n');
+    }
+
     fn fetchLine(self: Self, buffer: []u8) ![]u8 {
         var i: usize = 0;
         while (i < buffer.len) {
             const b = try self.port.reader().readByte();
-            buffer[i] = b;
-            i += 1;
-            if (std.mem.endsWith(u8, buffer[0..i], "\r\n")) {
-                return buffer[0 .. i - 2];
+
+            if (i == 0 and isLineEnd(b)) {
+                continue;
+            }
+
+            if (isLineEnd(b)) {
+                std.log.debug("incoming line: {}", .{std.fmt.fmtSliceEscapeUpper(buffer[0..i])});
+                return buffer[0..i];
+            } else {
+                buffer[i] = b;
+                i += 1;
             }
         }
         return error.InputTooLarge;
     }
+
+    fn linePrinter(self: Self) LinePrinter {
+        return LinePrinter{ .self = self };
+    }
+
+    const LinePrinter = struct {
+        self: Self,
+        stream: std.BoundedArray(u8, 512) = .{},
+
+        const Writer = std.io.Writer(*LinePrinter, PrintError, write);
+        pub fn writer(self: *@This()) Writer {
+            return Writer{ .context = self };
+        }
+
+        const PrintError = error{OutOfMemory};
+        fn write(self: *@This(), buffer: []const u8) PrintError!usize {
+            std.debug.assert(std.mem.indexOfAny(u8, buffer, "\r\n") == null);
+            self.stream.appendSlice(buffer) catch return error.OutOfMemory;
+            return buffer.len;
+        }
+
+        pub fn flush(self: *@This()) !void {
+            try self.stream.appendSlice("\r\n");
+
+            try self.self.port.writeAll(self.stream.slice());
+
+            const sent = self.stream.slice()[0 .. self.stream.len - 2];
+
+            std.log.debug("outgoing line: {}", .{std.fmt.fmtSliceEscapeUpper(sent)});
+
+            //if (self.echo == .with_echo)
+            {
+                var echo: [self.stream.buffer.len]u8 = undefined;
+                const line = try self.self.fetchLine(&echo);
+
+                if (!std.mem.eql(u8, line, sent)) {
+                    std.log.warn("expected: {}", .{std.fmt.fmtSliceEscapeUpper(sent)});
+                    std.log.warn("actual:   {}", .{std.fmt.fmtSliceEscapeUpper(line)});
+                    return error.UnexpectedData;
+                }
+            }
+        }
+    };
 
     const ErrorCode = enum(u32) {
         success = 0,
