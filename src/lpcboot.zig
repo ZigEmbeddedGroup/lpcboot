@@ -3,6 +3,8 @@ const std = @import("std");
 const serial = @import("serial");
 const uuencode = @import("uuencode");
 
+const db = @import("database.zig");
+
 pub const Isp = struct {
     const Self = @This();
 
@@ -262,8 +264,18 @@ pub const Isp = struct {
         }
     }
 
-    pub fn prepareSector(self: Self) !void {
-        _ = self;
+    pub fn prepaseSector(self: Self, sector: usize) !void {
+        return eraseSectors(self, sector, sector);
+    }
+
+    pub fn prepaseSectors(self: Self, first: usize, last: usize) !void {
+        var start_buf: [32]u8 = undefined;
+        var end_buf: [32]u8 = undefined;
+
+        const start = std.fmt.bufPrint(&start_buf, "{d}", .{first}) catch unreachable;
+        const end = std.fmt.bufPrint(&end_buf, "{d}", .{last}) catch unreachable;
+
+        try self.exec(.prepare_sector, &.{ start, end }); // T is Thumb
     }
 
     pub fn copyRamToFlash(self: Self) !void {
@@ -280,15 +292,25 @@ pub const Isp = struct {
         try self.exec(.go, &.{ off_digits, "T" }); // T is Thumb
     }
 
-    pub fn eraseSector(self: Self) !void {
-        _ = self;
+    pub fn eraseSector(self: Self, sector: usize) !void {
+        return eraseSectors(self, sector, sector);
+    }
+
+    pub fn eraseSectors(self: Self, first: usize, last: usize) !void {
+        var start_buf: [32]u8 = undefined;
+        var end_buf: [32]u8 = undefined;
+
+        const start = std.fmt.bufPrint(&start_buf, "{d}", .{first}) catch unreachable;
+        const end = std.fmt.bufPrint(&end_buf, "{d}", .{last}) catch unreachable;
+
+        try self.exec(.erase_sector, &.{ start, end }); // T is Thumb
     }
 
     pub fn blankCheckSector(self: Self) !void {
         _ = self;
     }
 
-    pub fn readPartId(self: Self) !PartID {
+    pub fn readPartId(self: Self) !db.PartID {
         try self.exec(.read_part_id, &.{});
 
         var pid: [64]u8 = undefined;
@@ -296,7 +318,7 @@ pub const Isp = struct {
 
         const pid_num = std.fmt.parseInt(u32, line, 10) catch return error.UnexpectedData;
 
-        return @intToEnum(PartID, pid_num);
+        return @intToEnum(db.PartID, pid_num);
     }
 
     pub const Version = struct { major: u8, minor: u8 };
@@ -535,23 +557,5 @@ pub const Isp = struct {
         read_boot_code_version = 'K',
         read_serial = 'N',
         compare = 'M',
-    };
-
-    pub const PartID = enum(u32) {
-        lpc1769 = 638664503, // 0x2611_3F37
-        lpc1768 = 637615927, // 0x2601_3F37
-        lpc1767 = 637610039, // 0x2601_2837
-        lpc1766 = 637615923, // 0x2601_3F33
-        lpc1765 = 637613875, // 0x2601_3733
-        lpc1764 = 637606178, // 0x2601_1922
-        lpc1763 = 637607987, // 0x2601_2033
-        lpc1759 = 621885239, // 0x2511_3737
-        lpc1758 = 620838711, // 0x2501_3F37
-        lpc1756 = 620828451, // 0x2501_1723
-        lpc1754 = 620828450, // 0x2501_1722
-        lpc1752 = 620761377, // 0x2500_1121
-        lpc1751 = 620761368, // 0x2500_1118
-        lpc1751_borked = 620761360, // 0x2500_1110
-        _,
     };
 };
