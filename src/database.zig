@@ -37,17 +37,17 @@ pub const DeviceFamily = enum {
 };
 
 pub const Sector = struct {
+    index: u32,
     offset: u32,
     length: u32,
 
     fn make(index: u32, size: u32, low: u32, high: u32) Sector {
-        _ = index;
-
         const length = high - low + 1;
         std.debug.assert(1024 * size == length);
         return Sector{
             .offset = low,
             .length = length,
+            .index = index,
         };
     }
 };

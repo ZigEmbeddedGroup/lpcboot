@@ -4,6 +4,7 @@ const serial = @import("serial");
 const uuencode = @import("uuencode");
 
 const db = @import("database.zig");
+const logger = std.log.scoped(.lpcboot);
 
 pub const Isp = struct {
     const Self = @This();
@@ -31,7 +32,7 @@ pub const Isp = struct {
         serial.changeControlPins(self.port, .{
             .dtr = false,
             .rts = false,
-        }) catch std.log.err("failed to raise both pins", .{});
+        }) catch logger.err("failed to raise both pins", .{});
 
         self.port.close();
         self.* = undefined;
@@ -80,7 +81,7 @@ pub const Isp = struct {
             if (c == 'S') {
                 const expected = "Synchronized\r\n";
 
-                std.log.info("performing handshake...", .{});
+                logger.info("performing handshake...", .{});
 
                 var input: [expected.len]u8 = undefined;
                 input[0] = c;
@@ -88,13 +89,13 @@ pub const Isp = struct {
 
                 if (std.mem.eql(u8, &input, expected)) {
                     try writer.writeAll(expected);
-                    std.log.info("handshake done.", .{});
+                    logger.info("handshake done.", .{});
                     break :sync_loop;
                 }
-                std.log.err("failed to handshake", .{});
+                logger.err("failed to handshake", .{});
                 return error.HandshakeFailed;
             } else {
-                std.log.info("unexpected sync: {c}", .{c});
+                logger.info("unexpected sync: {c}", .{c});
             }
         }
         // device is echoing while handshaking, so we have to expected "request\r\nanswer\r\n"
@@ -169,7 +170,7 @@ pub const Isp = struct {
                     try lp.writer().print("{d}", .{calc_checksum});
                     try lp.flush();
                 }
-                std.log.info("sending checksum: {d}", .{calc_checksum});
+                logger.debug("sending checksum: {d}", .{calc_checksum});
 
                 checksum_loop: while (true) {
                     var cs_buffer: [4096]u8 = undefined;
@@ -180,7 +181,7 @@ pub const Isp = struct {
                         failure_counter = 0;
                         break :checksum_loop;
                     } else if (std.mem.eql(u8, checksum_request, "RESEND")) {
-                        std.log.info("bad checksum, resend data...", .{});
+                        logger.info("bad checksum, resend data...", .{});
                         i = checksum_offset;
 
                         failure_counter += 1;
@@ -190,8 +191,7 @@ pub const Isp = struct {
 
                         break :checksum_loop;
                     } else {
-                        std.log.err("unexpected checksum response: {s}", .{std.fmt.fmtSliceEscapeUpper(checksum_request)});
-
+                        logger.err("unexpected checksum response: {s}", .{std.fmt.fmtSliceEscapeUpper(checksum_request)});
                         return error.UnexpectedData;
                     }
                 }
@@ -251,7 +251,7 @@ pub const Isp = struct {
                     try lp.writer().writeAll("OK");
                     try lp.flush();
                 } else {
-                    std.log.err("checksum mismatch: Expected {d}, received {d}", .{
+                    logger.err("checksum mismatch: Expected {d}, received {d}", .{
                         calc_checksum,
                         sent_checksum,
                     });
@@ -264,22 +264,29 @@ pub const Isp = struct {
         }
     }
 
-    pub fn prepaseSector(self: Self, sector: usize) !void {
-        return eraseSectors(self, sector, sector);
+    pub fn prepareSector(self: Self, sector: usize) !void {
+        return prepareSectors(self, sector, sector);
     }
 
-    pub fn prepaseSectors(self: Self, first: usize, last: usize) !void {
-        var start_buf: [32]u8 = undefined;
-        var end_buf: [32]u8 = undefined;
+    pub fn prepareSectors(self: Self, first: usize, last: usize) !void {
+        var bufs: [2][32]u8 = undefined;
 
-        const start = std.fmt.bufPrint(&start_buf, "{d}", .{first}) catch unreachable;
-        const end = std.fmt.bufPrint(&end_buf, "{d}", .{last}) catch unreachable;
+        const start = std.fmt.bufPrint(&bufs[0], "{d}", .{first}) catch unreachable;
+        const end = std.fmt.bufPrint(&bufs[1], "{d}", .{last}) catch unreachable;
 
-        try self.exec(.prepare_sector, &.{ start, end }); // T is Thumb
+        try self.exec(.prepare_sector, &.{ start, end });
     }
 
-    pub fn copyRamToFlash(self: Self) !void {
-        _ = self;
+    pub const BlockSize = enum(u32) { @"512" = 512, @"1024" = 1024, @"2048" = 2048, @"4096" = 4096 };
+
+    pub fn copyRamToFlash(self: Self, flash_address: u32, ram_address: u32, block_size: BlockSize) !void {
+        var bufs: [3][32]u8 = undefined;
+
+        const flash = std.fmt.bufPrint(&bufs[0], "{d}", .{flash_address}) catch unreachable;
+        const ram = std.fmt.bufPrint(&bufs[1], "{d}", .{ram_address}) catch unreachable;
+        const size = std.fmt.bufPrint(&bufs[2], "{d}", .{@enumToInt(block_size)}) catch unreachable;
+
+        try self.exec(.copy_ram_to_flash, &.{ flash, ram, size });
     }
 
     pub fn go(self: Self, address: u32) !void {
@@ -383,7 +390,7 @@ pub const Isp = struct {
         const ack_string = try self.fetchLine(&buffer);
 
         const numeric = std.fmt.parseInt(u32, ack_string, 10) catch {
-            std.log.err("expected response number, got {}", .{std.fmt.fmtSliceEscapeUpper(ack_string)});
+            logger.err("expected response number, got {}", .{std.fmt.fmtSliceEscapeUpper(ack_string)});
             return error.UnexpectedData;
         };
 
@@ -398,7 +405,7 @@ pub const Isp = struct {
         const ack_string = try self.fetchLine(&buffer);
 
         if (!std.mem.eql(u8, ack_string, expected)) {
-            std.log.warn("unexpected data: {s}", .{
+            logger.warn("unexpected data: {s}", .{
                 std.fmt.fmtSliceEscapeUpper(ack_string),
             });
             return error.UnexpectedData;
@@ -419,7 +426,7 @@ pub const Isp = struct {
             }
 
             if (isLineEnd(b)) {
-                std.log.debug("incoming line: {}", .{std.fmt.fmtSliceEscapeUpper(buffer[0..i])});
+                logger.debug("incoming line: {}", .{std.fmt.fmtSliceEscapeUpper(buffer[0..i])});
                 return buffer[0..i];
             } else {
                 buffer[i] = b;
@@ -456,7 +463,7 @@ pub const Isp = struct {
 
             const sent = self.stream.slice()[0 .. self.stream.len - 2];
 
-            std.log.debug("outgoing line: {}", .{std.fmt.fmtSliceEscapeUpper(sent)});
+            logger.debug("outgoing line: {}", .{std.fmt.fmtSliceEscapeUpper(sent)});
 
             //if (self.echo == .with_echo)
             {
@@ -464,8 +471,8 @@ pub const Isp = struct {
                 const line = try self.self.fetchLine(&echo);
 
                 if (!std.mem.eql(u8, line, sent)) {
-                    std.log.warn("expected: {}", .{std.fmt.fmtSliceEscapeUpper(sent)});
-                    std.log.warn("actual:   {}", .{std.fmt.fmtSliceEscapeUpper(line)});
+                    logger.warn("expected: {}", .{std.fmt.fmtSliceEscapeUpper(sent)});
+                    logger.warn("actual:   {}", .{std.fmt.fmtSliceEscapeUpper(line)});
                     return error.UnexpectedData;
                 }
             }
