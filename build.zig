@@ -10,5 +10,5 @@ pub fn build(b: *std.build.Builder) void {
         .target = target,
         .optimize = optimize,
     });
-    lpc_patch_elf.install();
+    b.installArtifact(lpc_patch_elf);
 }
